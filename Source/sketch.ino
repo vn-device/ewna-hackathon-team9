@@ -1,5 +1,5 @@
 #include <Arduino_RouterBridge.h>
-#include <Modulino.h>
+#include <Arduino_Modulino.h>
 
 ModulinoPixels pixels;
 ModulinoBuzzer  buzzer;
