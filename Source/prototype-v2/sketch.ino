@@ -1,163 +1,318 @@
+#include <Arduino.h>
 #include <Arduino_RouterBridge.h>
 #include <Modulino.h>
 
+// 1 = cycle through gestures automatically after 5 s of idle.
+// 0 = gestures are only triggered externally (e.g. Python over the Arduino Bridge).
+#define DEMO_MODE 0
+
 ModulinoPixels pixels;
-ModulinoBuzzer  buzzer;
+ModulinoBuzzer buzzer;
 
-// ---------- colors ----------
-ModulinoColor C_OFF  (0,   0,   0);
-ModulinoColor C_GREY (60,  60,  60);
-ModulinoColor C_PAUSE(255, 140, 0);    // amber
-ModulinoColor C_OK   (0,   255, 0);    // green
-ModulinoColor C_SKIP (0,   80,  255);  // blue
+// Modulino Industrial Andon Color Palette from README
+const ModulinoColor C_PAUSE(255, 140, 0); // Solid Industrial Amber
+const ModulinoColor C_OK(0, 255, 0);      // Solid Pure Green
+const ModulinoColor C_SKIP(0, 220, 255);  // Process Cyan
+const ModulinoColor C_IDLE(0, 15, 80);    // Dim Cobalt Baseline (reserved for later use)
+const ModulinoColor C_FAULT(255, 0, 0);   // Emergency Red
+const ModulinoColor C_GREY(60, 60, 60);   // Idle heartbeat blink
+const ModulinoColor C_OFF(0, 0, 0);
 
-const uint8_t NUM_PIX     = 8;
-const uint8_t BRIGHT      = 25;
-const uint8_t BRIGHT_IDLE = 8;
+const uint8_t NUM_PIX = 8;
+const uint8_t BRIGHT_STD = 30; // 30% brightness to keep bus current within specs
+const uint8_t BRIGHT_DIM = 8;  // Baseline idle brightness
 
-// ---------- timing ----------
-const unsigned long BLINK_MS    = 500;   // idle blink period (half)
-const unsigned long TRACK_TO_MS = 500;   // no tracking update -> back to idle
-const unsigned long HOLD_MS     = 2000;  // gesture stays lit
-const unsigned long SWEEP_MS    = 45;    // per-pixel swipe step
-const unsigned long FADE_MS     = 60;    // per-pixel fade step
+// Timing (ms)
+const unsigned long IDLE_BLINK_MS = 500;    // grey on/off period in IDLE
+const unsigned long SWEEP_STEP_MS = 45;     // per-pixel light-up during a swipe
+const unsigned long HOLD_MS = 2000;         // full-bar hold before fading
+const unsigned long FADE_STEP_MS = 60;      // per-pixel turn-off during fade
+const unsigned long FAULT_PHASE_MS = 80;    // red flash on/off half-period
+const uint8_t FAULT_FLASHES = 3;
+const unsigned long GESTURE_TIMEOUT_MS = 8000; // failsafe: force IDLE if a gesture overruns
+const unsigned long DEMO_IDLE_MS = 5000;    // idle time before the demo fires the next gesture
 
-// ---------- state machine ----------
-enum State { IDLE, TRACKING, SWEEP, SHOWING, FADE };
-State state = IDLE;
+enum class State : uint8_t
+{
+    IDLE,    // grey blink, waiting for a gesture
+    SWEEP,   // pixels lighting one at a time
+    SHOWING, // full bar held
+    FADE,    // pixels turning off one at a time
+    FAULT    // red strobe
+};
 
-unsigned long stateMs = 0, lastStepMs = 0, lastBlinkMs = 0;
-bool blinkOn = false;
-int  step = 0, dir = 1;
-ModulinoColor animColor = C_SKIP;
+State state = State::IDLE;
+unsigned long stateStart = 0;   // millis() when the current state was entered
+unsigned long gestureStart = 0; // millis() when the current gesture began (failsafe)
+unsigned long lastStep = 0;     // millis() of the last animation step
+uint8_t stepCount = 0;          // animation step within the current state
+int8_t animDir = 1;             // +1 = pixel 0 -> 7, -1 = pixel 7 -> 0
+const ModulinoColor* curColor = &C_OFF;
+bool idleLit = false;
 
-// ---------- helpers ----------
-void fill(ModulinoColor c, uint8_t b) {
-  for (uint8_t i = 0; i < NUM_PIX; i++) pixels.set(i, c, b);
-  pixels.show();
+void setAllPixels(const ModulinoColor& color, uint8_t brightness)
+{
+    for (uint8_t i = 0; i < NUM_PIX; i++)
+    {
+        pixels.set(i, color, brightness);
+    }
+    pixels.show();
 }
 
-void bar(ModulinoColor c, uint8_t n, uint8_t b) {
-  for (uint8_t i = 0; i < NUM_PIX; i++)
-    pixels.set(i, i < n ? c : C_OFF, i < n ? b : 0);
-  pixels.show();
+void clearPixels()
+{
+    pixels.clear();
+    pixels.show();
 }
 
-uint8_t confToPixels(int conf) {
-  int n = (conf * NUM_PIX) / 100;
-  if (n < 1) n = 1;
-  if (n > NUM_PIX) n = NUM_PIX;
-  return (uint8_t)n;
+// Maps the n-th step of an animation to a physical pixel index for the given direction.
+uint8_t pixelAt(uint8_t n, int8_t dir)
+{
+    return (dir > 0) ? n : (NUM_PIX - 1 - n);
 }
 
-void enterIdle() {
-  state = IDLE;
-  blinkOn = false;
-  lastBlinkMs = 0;              // blink immediately
-  fill(C_OFF, 0);
+void enterState(State s)
+{
+    state = s;
+    stateStart = millis();
+    lastStep = stateStart;
+    stepCount = 0;
 }
 
-// ---------- Bridge handlers ----------
+// =============================================================================
+// Gesture start functions: set LEDs/tone, then return immediately.
+// =============================================================================
 
-// Nothing detected
-void setIdle() {
-  enterIdle();
+void enterIdle()
+{
+    buzzer.noTone();
+    enterState(State::IDLE);
+    idleLit = true;
+    setAllPixels(C_GREY, BRIGHT_DIM);
 }
 
-// Hand seen, no gesture committed yet: solid grey confidence bar
-void setTracking(int conf) {
-  if (state == SWEEP || state == SHOWING || state == FADE) return;  // don't interrupt
-  state = TRACKING;
-  stateMs = millis();
-  bar(C_GREY, confToPixels(conf), BRIGHT);
+// PAUSE / HOLD (Solid Industrial Amber, Low Caution Tone 440 Hz)
+void startPause()
+{
+    gestureStart = millis();
+    curColor = &C_PAUSE;
+    animDir = 1; // fade left-to-right
+    setAllPixels(*curColor, BRIGHT_STD);
+    buzzer.tone(440, 250);
+    enterState(State::SHOWING);
 }
 
-// Static gesture: 1 = pause, 2 = confirm. Bar length = confidence
-void setAction(int code, int conf) {
-  dir = 1;                      // fade left-to-right afterward
-  if (code == 1) {
-    bar(C_PAUSE, confToPixels(conf), BRIGHT);
-    buzzer.tone(330, 250);                                  // low, long
-  } else {
-    bar(C_OK, confToPixels(conf), BRIGHT);
-    buzzer.tone(880, 100); delay(80); buzzer.tone(880, 100); // double high
-  }
-  state = SHOWING;
-  stateMs = millis();
+// CONFIRM / ACK (Solid Pure Green, Rising Chime 523 Hz -> 659 Hz)
+void startConfirm()
+{
+    gestureStart = millis();
+    curColor = &C_OK;
+    animDir = 1; // fade left-to-right
+    setAllPixels(*curColor, BRIGHT_STD);
+    buzzer.tone(523, 100);
+    delay(120);
+    buzzer.tone(659, 150);
+    enterState(State::SHOWING);
 }
 
-// Swipe: +1 = left-to-right, -1 = right-to-left
-void setSwipe(int d) {
-  dir = d;
-  animColor = C_SKIP;
-  step = (dir > 0) ? 0 : NUM_PIX - 1;
-  fill(C_OFF, 0);
-  if (dir > 0) { buzzer.tone(500, 80); delay(40); buzzer.tone(750, 80); }  // rising
-  else         { buzzer.tone(750, 80); delay(40); buzzer.tone(500, 80); }  // falling
-  state = SWEEP;
-  lastStepMs = millis();
+// SWIPE (Process Cyan sweep; rising 660 -> 880 Hz for +1, falling 880 -> 660 Hz for -1)
+void startSwipe(int dir)
+{
+    gestureStart = millis();
+    curColor = &C_SKIP;
+    animDir = (dir >= 0) ? 1 : -1;
+
+    if (animDir > 0)
+    {
+        buzzer.tone(660, 100);
+        delay(120);
+        buzzer.tone(880, 150);
+    }
+    else
+    {
+        buzzer.tone(880, 100);
+        delay(120);
+        buzzer.tone(660, 150);
+    }
+
+    // Light the first pixel now; loop() lights the rest every SWEEP_STEP_MS.
+    pixels.clear();
+    pixels.set(pixelAt(0, animDir), *curColor, BRIGHT_STD);
+    pixels.show();
+    enterState(State::SWEEP);
+    stepCount = 1;
 }
 
-// ---------- setup / loop ----------
-void setup() {
-  Modulino.begin();
-  pixels.begin();
-  buzzer.begin();
-
-  Bridge.begin();
-  Bridge.provide("set_idle",     setIdle);
-  Bridge.provide("set_tracking", setTracking);
-  Bridge.provide("set_action",   setAction);
-  Bridge.provide("set_swipe",    setSwipe);
-
-  enterIdle();
+// REJECT / FAULT (Strobe Emergency Red, Error Buzz 220 Hz)
+void startFault()
+{
+    gestureStart = millis();
+    curColor = &C_FAULT;
+    buzzer.tone(220, 300);
+    setAllPixels(*curColor, BRIGHT_STD); // phase 0 = on
+    enterState(State::FAULT);
 }
 
-void loop() {
-  unsigned long now = millis();
+// Zero-argument wrappers so the Bridge can register each swipe direction by name.
+void swipeLeft()  { startSwipe(-1); }
+void swipeRight() { startSwipe(+1); }
 
-  switch (state) {
+// =============================================================================
+// Per-state update functions, called from loop()
+// =============================================================================
 
-    case IDLE:                                     // grey blink
-      if (now - lastBlinkMs >= BLINK_MS) {
-        lastBlinkMs = now;
-        blinkOn = !blinkOn;
-        fill(blinkOn ? C_GREY : C_OFF, blinkOn ? BRIGHT_IDLE : 0);
-      }
-      break;
+void runNextDemoGesture()
+{
+    static uint8_t demoIndex = 0;
+    switch (demoIndex)
+    {
+    case 0: startSwipe(-1); break;
+    case 1: startSwipe(+1); break;
+    case 2: startPause();   break;
+    case 3: startConfirm(); break;
+    case 4: startFault();   break;
+    }
+    demoIndex = (demoIndex + 1) % 5;
+}
 
-    case TRACKING:                                 // hand lost -> idle
-      if (now - stateMs >= TRACK_TO_MS) enterIdle();
-      break;
+void updateIdle(unsigned long now)
+{
+    if (now - lastStep >= IDLE_BLINK_MS)
+    {
+        lastStep = now;
+        idleLit = !idleLit;
+        if (idleLit)
+        {
+            setAllPixels(C_GREY, BRIGHT_DIM);
+        }
+        else
+        {
+            clearPixels();
+        }
+    }
 
-    case SWEEP:                                    // light follows the hand
-      if (now - lastStepMs >= SWEEP_MS) {
-        lastStepMs = now;
-        pixels.set(step, animColor, BRIGHT);
-        pixels.show();
-        step += dir;
-        if (step < 0 || step >= NUM_PIX) { state = SHOWING; stateMs = now; }
-      }
-      break;
+#if DEMO_MODE
+    if (now - stateStart >= DEMO_IDLE_MS)
+    {
+        runNextDemoGesture();
+    }
+#endif
+}
 
-    case SHOWING:                                  // hold, then fade
-      if (now - stateMs >= HOLD_MS) {
-        state = FADE;
-        step = (dir > 0) ? 0 : NUM_PIX - 1;
-        lastStepMs = now;
-      }
-      break;
+void updateSweep(unsigned long now)
+{
+    if (now - lastStep < SWEEP_STEP_MS)
+    {
+        return;
+    }
+    lastStep = now;
 
-    case FADE:                                     // off in the same direction
-      if (now - lastStepMs >= FADE_MS) {
-        lastStepMs = now;
-        pixels.set(step, C_OFF, 0);
-        pixels.show();
-        step += dir;
-        if (step < 0 || step >= NUM_PIX) enterIdle();
-      }
-      break;
-  }
+    pixels.set(pixelAt(stepCount, animDir), *curColor, BRIGHT_STD);
+    pixels.show();
+    stepCount++;
 
-  delay(5);
+    if (stepCount >= NUM_PIX)
+    {
+        enterState(State::SHOWING); // hold timer starts once the bar is full
+    }
+}
+
+void updateShowing(unsigned long now)
+{
+    if (now - stateStart >= HOLD_MS)
+    {
+        enterState(State::FADE);
+    }
+}
+
+void updateFade(unsigned long now)
+{
+    if (now - lastStep < FADE_STEP_MS)
+    {
+        return;
+    }
+    lastStep = now;
+
+    pixels.set(pixelAt(stepCount, animDir), C_OFF, 0);
+    pixels.show();
+    stepCount++;
+
+    if (stepCount >= NUM_PIX)
+    {
+        enterIdle();
+    }
+}
+
+void updateFault(unsigned long now)
+{
+    if (now - lastStep < FAULT_PHASE_MS)
+    {
+        return;
+    }
+    lastStep = now;
+    stepCount++;
+
+    if (stepCount >= FAULT_FLASHES * 2)
+    {
+        enterIdle();
+    }
+    else if (stepCount % 2 == 0)
+    {
+        setAllPixels(*curColor, BRIGHT_STD);
+    }
+    else
+    {
+        clearPixels();
+    }
+}
+
+void setup()
+{
+    Serial.begin(115200);
+
+    // Initialize underlying I2C Wire driver on Qwiic bus
+    Modulino.begin();
+
+    if (!pixels.begin())
+    {
+        Serial.println("Error: Modulino Pixels failed to initialize.");
+    }
+
+    if (!buzzer.begin())
+    {
+        Serial.println("Error: Modulino Buzzer failed to initialize.");
+    }
+
+    // Gesture entry points called from main.py over the Arduino Bridge
+    Bridge.begin();
+    Bridge.provide("swipe_left",  swipeLeft);
+    Bridge.provide("swipe_right", swipeRight);
+    Bridge.provide("pause",   startPause);
+    Bridge.provide("confirm", startConfirm);
+    Bridge.provide("fault",   startFault);
+
+    clearPixels();
+    delay(500);
+    enterIdle();
+}
+
+void loop()
+{
+    unsigned long now = millis();
+
+    // Failsafe: no gesture may run longer than GESTURE_TIMEOUT_MS.
+    if (state != State::IDLE && now - gestureStart >= GESTURE_TIMEOUT_MS)
+    {
+        enterIdle();
+        return;
+    }
+
+    switch (state)
+    {
+    case State::IDLE:    updateIdle(now);    break;
+    case State::SWEEP:   updateSweep(now);   break;
+    case State::SHOWING: updateShowing(now); break;
+    case State::FADE:    updateFade(now);    break;
+    case State::FAULT:   updateFault(now);   break;
+    }
 }
