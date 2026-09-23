@@ -8,8 +8,8 @@ from arduino.app_utils import App, Bridge
 
 # Protocol Actions
 IDLE = 0
-PAUSE = 1       # five (Orange)
-GOOD = 2        # good (Green Flash)
+PAUSE = 1       # static five (Orange)
+GOOD = 2        # thumbs up (Green Flash)
 SWIPE_RIGHT = 3 # swipe right (Blue)
 SWIPE_LEFT = 4  # swipe left (Blue)
 
@@ -49,39 +49,43 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 cap.set(cv2.CAP_PROP_FPS, 30)
 
-# Trajectory window for horizontal swipe detection
+# Swipe trajectory buffer
 swipe_history = []
-SWIPE_WINDOW_SEC = 1.0
-SWIPE_MIN_DELTA_X = 0.25
+SWIPE_WINDOW_SEC = 1.2
+SWIPE_MIN_DELTA_X = 0.07  # Sensitive swipe detection (7% frame width)
+
+# Static five timing and position latching
+five_first_seen_time = 0.0
+last_five_seen_time = 0.0
+STATIC_FIVE_DWELL_SEC = 0.40
 
 last_action_time = 0.0
 current_stable_action = IDLE
 action_candidate_counter = 0
 
-ACTION_DEBOUNCE_SEC = 1.2
-CONFIRMATION_FRAMES = 2
-CONFIDENCE_THRESHOLD = 0.60
+ACTION_DEBOUNCE_SEC = 0.9
+CONFIDENCE_THRESHOLD = 0.38
+MOTION_TRACK_THRESHOLD = 0.18
 
-def detect_swipe(now: float) -> int:
+def evaluate_motion(now: float):
     global swipe_history
+    # Retain points within the sliding time window
     swipe_history = [(t, x) for (t, x) in swipe_history if now - t <= SWIPE_WINDOW_SEC]
-    if len(swipe_history) < 3:
-        return IDLE
+    if len(swipe_history) < 2:
+        return IDLE, 0.0
 
-    start_t, start_x = swipe_history[0]
-    end_t, end_x = swipe_history[-1]
+    start_x = swipe_history[0][1]
+    end_x = swipe_history[-1][1]
     dx = end_x - start_x
 
     if abs(dx) >= SWIPE_MIN_DELTA_X:
         swipe_history.clear()
-        if dx > 0:
-            return SWIPE_RIGHT
-        else:
-            return SWIPE_LEFT
-    return IDLE
+        return (SWIPE_RIGHT if dx > 0 else SWIPE_LEFT), abs(dx)
+    return IDLE, abs(dx)
 
 def loop() -> None:
-    global last_action_time, current_stable_action, action_candidate_counter, swipe_history
+    global last_action_time, current_stable_action, action_candidate_counter
+    global swipe_history, five_first_seen_time, last_five_seen_time
 
     if not cap.isOpened():
         time.sleep(0.5)
@@ -93,7 +97,7 @@ def loop() -> None:
 
     now = time.time()
 
-    # Mirror horizontally for natural perspective
+    # Mirror horizontally for natural user perspective
     frame = cv2.flip(frame, 1)
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
@@ -104,8 +108,6 @@ def loop() -> None:
     best_label = "none"
     detected_norm_x = None
 
-    # Parse bounding boxes from object detection output
-    # Only target gestures: 'five' and 'good' (everything else, including 'none' and 'neut', is idle)
     if "result" in res:
         if "bounding_boxes" in res["result"] and len(res["result"]["bounding_boxes"]) > 0:
             for bb in res["result"]["bounding_boxes"]:
@@ -127,34 +129,43 @@ def loop() -> None:
 
     detected_action = IDLE
 
-    if highest_conf >= CONFIDENCE_THRESHOLD:
-        if best_label == "five":
-            if detected_norm_x is not None:
-                swipe_history.append((now, detected_norm_x))
-                swipe_action = detect_swipe(now)
-                if swipe_action != IDLE:
-                    detected_action = swipe_action
-                else:
-                    detected_action = PAUSE
-            else:
+    # Track open-palm coordinates even across low-confidence motion-blurred frames
+    if best_label == "five" and detected_norm_x is not None and highest_conf >= MOTION_TRACK_THRESHOLD:
+        swipe_history.append((now, detected_norm_x))
+        last_five_seen_time = now
+        if five_first_seen_time == 0.0:
+            five_first_seen_time = now
+
+        motion_action, total_disp = evaluate_motion(now)
+        if motion_action != IDLE:
+            detected_action = motion_action
+            five_first_seen_time = 0.0
+        elif (now - five_first_seen_time >= STATIC_FIVE_DWELL_SEC) and (highest_conf >= CONFIDENCE_THRESHOLD):
+            # Only latch static five if the hand was truly still (displacement < 0.05)
+            if total_disp < 0.05:
                 detected_action = PAUSE
-        elif best_label == "good":
-            swipe_history.clear()
-            detected_action = GOOD
+                five_first_seen_time = 0.0
+    elif best_label == "good" and highest_conf >= CONFIDENCE_THRESHOLD:
+        swipe_history.clear()
+        five_first_seen_time = 0.0
+        detected_action = GOOD
     else:
-        # No target hand gesture in view -> idle
-        if now - last_action_time > SWIPE_WINDOW_SEC:
-            swipe_history.clear()
+        # Tolerate up to 0.35 seconds of frame loss (motion blur/none) before resetting trajectory
+        if now - last_five_seen_time > 0.35:
+            five_first_seen_time = 0.0
+            if now - last_action_time > SWIPE_WINDOW_SEC:
+                swipe_history.clear()
 
     # Dispatch to Arduino sketch
     if detected_action != IDLE:
         if detected_action in (SWIPE_LEFT, SWIPE_RIGHT):
-            if now - last_action_time > 0.8:
+            if now - last_action_time > 0.4:
                 action_name = "swipe_right" if detected_action == SWIPE_RIGHT else "swipe_left"
                 stats[action_name] += 1
                 print_scoreboard(action_name)
                 Bridge.call("set_action", detected_action, scaled_conf)
                 last_action_time = now
+                five_first_seen_time = 0.0
         else:
             if detected_action == current_stable_action:
                 action_candidate_counter += 1
@@ -162,15 +173,15 @@ def loop() -> None:
                 current_stable_action = detected_action
                 action_candidate_counter = 1
 
-            if action_candidate_counter >= CONFIRMATION_FRAMES and (now - last_action_time > ACTION_DEBOUNCE_SEC):
+            if action_candidate_counter >= 1 and (now - last_action_time > ACTION_DEBOUNCE_SEC):
                 action_name = "five" if detected_action == PAUSE else "good"
                 stats[action_name] += 1
                 print_scoreboard(action_name)
                 Bridge.call("set_action", detected_action, scaled_conf)
                 last_action_time = now
                 action_candidate_counter = 0
+                five_first_seen_time = 0.0
     else:
-        # Keep Modulino solid idle white when nothing is detected
         Bridge.call("set_tracking", 0)
         action_candidate_counter = 0
         current_stable_action = IDLE
